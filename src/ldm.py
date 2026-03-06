@@ -81,7 +81,8 @@ def run(args):
     print('Start training...')
     
     # Main training loop
-    for _ in range(args.train_nepoch):
+    start_epoch = ldm.epoch
+    for _ in range(start_epoch, args.train_nepoch):
 
         # Train for one epoch
         ldm.train_one_epoch()        

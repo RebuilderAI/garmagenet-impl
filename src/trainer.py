@@ -547,9 +547,7 @@ class GarmageNetTrainer():
                     raise NotImplementedError
 
                 # Update model ===
-                with torch.autograd.set_detect_anomaly(True):
-                    self.scaler.scale(total_loss).backward()
-                # self.scaler.scale(total_loss).backward()
+                self.scaler.scale(total_loss).backward()
 
                 nn.utils.clip_grad_norm_(self.network_params, max_norm=50.0)  # clip gradient
                 self.scaler.step(self.optimizer)
