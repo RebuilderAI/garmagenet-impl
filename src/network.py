@@ -598,6 +598,8 @@ class GarmageNet(nn.Module):
             t_embs = t_embs + self.class_embed(class_label).squeeze(-2)
             # print('*** t_embs: ', t_embs.shape, t_embs.min(), t_embs.max())
 
+        cond_token = None
+
         # Processing global features (e.g. text prompt)
         if self.condition_dim > 0 and cond_global is not None:
             cond_token = self.cond_embed(cond_global)
