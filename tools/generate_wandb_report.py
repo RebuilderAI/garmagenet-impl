@@ -53,14 +53,12 @@ def build_vae_blocks(runset: wr.Runset) -> list:
 
     # --- Section 1: Validation Visualizations (Geometry) ---
     blocks.append(wr.H2(text="Validation — Geometry (NCS)"))
-    blocks.append(wr.P(text="Ground Truth input vs VAE Reconstruction output (logged every 5 epochs)."))
+    blocks.append(wr.P(text="VAE Reconstruction output (logged every 5 epochs). Input images logged from next training run."))
     blocks.append(wr.PanelGrid(
         runsets=[runset],
         panels=[
-            wr.MediaBrowser(media_keys=["Val-Geo-Input"], num_columns=1,
-                            layout=wr.Layout(x=0, y=0, w=24, h=8)),
             wr.MediaBrowser(media_keys=["Val-Geo"], num_columns=1,
-                            layout=wr.Layout(x=0, y=8, w=24, h=8)),
+                            layout=wr.Layout(x=0, y=0, w=24, h=10)),
         ],
     ))
 
@@ -69,10 +67,8 @@ def build_vae_blocks(runset: wr.Runset) -> list:
     blocks.append(wr.PanelGrid(
         runsets=[runset],
         panels=[
-            wr.MediaBrowser(media_keys=["Val-Mask-Input"], num_columns=1,
-                            layout=wr.Layout(x=0, y=0, w=24, h=8)),
             wr.MediaBrowser(media_keys=["Val-Mask"], num_columns=1,
-                            layout=wr.Layout(x=0, y=8, w=24, h=8)),
+                            layout=wr.Layout(x=0, y=0, w=24, h=10)),
         ],
     ))
 
