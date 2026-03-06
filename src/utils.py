@@ -68,7 +68,7 @@ def get_wandb_logging_meta(wandb_logging_dir):
     
     summary_fp = os.path.join(latest_run_dir, 'files', 'wandb-summary.json')
     with open(summary_fp, 'r') as f: summary_meta = json.load(f)
-    run_step = summary_meta['_step']
+    run_step = summary_meta.get('_step', 0)
     
     print('Resumming wandb logging from %s. RUN_ID: %s RUN_STEP: %d.'%(latest_run_dir, run_id, run_step))
     
