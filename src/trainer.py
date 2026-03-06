@@ -1,5 +1,6 @@
 import os
 import math
+import time
 from tqdm import tqdm
 
 import torch
@@ -7,7 +8,7 @@ import torch.nn as nn
 
 import wandb
 import numpy as np
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from diffusers import AutoencoderKL, DDPMScheduler
 
 from src.network import TextEncoder, SketchEncoder, PointcloudEncoder, GarmageNet, AutoencoderKLFastEncode
@@ -88,17 +89,24 @@ class VAETrainer():
         self.iters = run_step
 
         # Initilizer dataloader
+        self.num_workers = 16
         self.train_dataloader = torch.utils.data.DataLoader(
             self.train_dataset,
             shuffle=True,
             batch_size=self.batch_size,
-            num_workers=8
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
         )
         self.val_dataloader = torch.utils.data.DataLoader(
             self.val_dataset,
             shuffle=False,
             batch_size=self.batch_size,
-            num_workers=8
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
         )
 
         # Get Current Epoch
@@ -121,11 +129,17 @@ class VAETrainer():
         progress_bar = tqdm(total=len(self.train_dataloader))
         progress_bar.set_description(f"Epoch {self.epoch}")
 
+        epoch_data_time = 0.0
+        epoch_compute_time = 0.0
+        data_start = time.time()
+
         # Train
         for surf_data in self.train_dataloader:
+            epoch_data_time += time.time() - data_start
+            compute_start = time.time()
 
             with torch.cuda.amp.autocast():
-                surf_data = surf_data.to(self.device).permute(0,3,1,2)
+                surf_data = surf_data.to(self.device, non_blocking=True).permute(0,3,1,2)
                 self.optimizer.zero_grad() # zero gradient
 
                 # Pass through VAE
@@ -142,12 +156,13 @@ class VAETrainer():
                     raise NotImplementedError
 
                 # Update model
-                with torch.autograd.set_detect_anomaly(True):
-                    self.scaler.scale(total_loss).backward()
+                self.scaler.scale(total_loss).backward()
 
                 nn.utils.clip_grad_norm_(self.network_params, max_norm=5.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+            epoch_compute_time += time.time() - compute_start
 
             # logging
             if self.iters % 10 == 0:
@@ -164,20 +179,33 @@ class VAETrainer():
                         "mode-min": _z.min(),
                         "mode-max": _z.max(),
                         "mode-mean": _z.mean(),
-                        "mode-std": _z.std()
+                        "mode-std": _z.std(),
+                        "gpu-mem-MB": torch.cuda.max_memory_allocated() / 1024**2,
                     }, step=self.iters)
                 else:
                     raise NotImplementedError
 
             self.iters += 1
             progress_bar.update(1)
+            data_start = time.time()
 
         progress_bar.close()
+
+        # Log epoch-level timing for bottleneck diagnosis
+        wandb.log({
+            "timing/data_load_sec": epoch_data_time,
+            "timing/compute_sec": epoch_compute_time,
+            "timing/data_pct": epoch_data_time / max(epoch_data_time + epoch_compute_time, 1e-6) * 100,
+        }, step=self.iters)
+        print(f"  Epoch {self.epoch} timing: data={epoch_data_time:.1f}s, compute={epoch_compute_time:.1f}s, "
+              f"data%={epoch_data_time / max(epoch_data_time + epoch_compute_time, 1e-6) * 100:.1f}%")
 
         # update train dataset
         self.train_dataset.update()
         self.train_dataloader = torch.utils.data.DataLoader(
-            self.train_dataset, shuffle=True, batch_size=self.batch_size, num_workers=8)
+            self.train_dataset, shuffle=True, batch_size=self.batch_size,
+            num_workers=self.num_workers, pin_memory=True,
+            persistent_workers=True, prefetch_factor=2)
 
         self.epoch += 1
 
@@ -216,18 +244,40 @@ class VAETrainer():
                 if val_images is None and dec.shape[0] > 16:
                     sample_idx = torch.randperm(dec.shape[0])[:16]
                     val_images = make_grid(dec[sample_idx, ...], nrow=8, normalize=True, value_range=(-1,1))
+                    val_inputs = make_grid(surf_data[sample_idx, ...], nrow=8, normalize=True, value_range=(-1,1))
 
                     vis_log = {}
-                    if 'surf_ncs' in self.data_fields: vis_log['Val-Geo'] = wandb.Image(val_images[:3, ...], caption="Geometry output.")
+                    if 'surf_ncs' in self.data_fields:
+                        vis_log['Val-Geo-Input'] = wandb.Image(val_inputs[:3, ...], caption="Geometry input.")
+                        vis_log['Val-Geo'] = wandb.Image(val_images[:3, ...], caption="Geometry output.")
                     if 'surf_wcs' in self.data_fields:
+                        val_inputs2 = make_grid(surf_data[sample_idx, :3], nrow=8, normalize=False)
+                        val_inputs2[val_inputs2 != 0.0] = (val_inputs2[val_inputs2 != 0.0] + 1) / 2
+                        vis_log['Val-Geo-WCS-Input'] = wandb.Image(val_inputs2[:3, ...], caption="Geometry WCS input.")
                         val_images2 = make_grid(dec[sample_idx, :3], nrow=8, normalize=False)
                         val_images2[val_images2 != 0.0] = (val_images2[val_images2 != 0.0] + 1) / 2
                         vis_log['Val-Geo-WCS'] = wandb.Image(val_images2[:3, ...], caption="Geometry WCS output.")
-                    if 'surf_uv_ncs' in self.data_fields: vis_log['Val-UV'] = wandb.Image(val_images[-3:, ...], caption="UV output.")
-                    if 'surf_normals' in self.data_fields: vis_log['Val-Normal'] = wandb.Image(val_images[3:6, ...], caption="Normal output.")
-                    if 'surf_mask' in self.data_fields: vis_log['Val-Mask'] = wandb.Image(val_images[-1:, ...], caption="Mask output.")
+                    if 'surf_uv_ncs' in self.data_fields:
+                        vis_log['Val-UV-Input'] = wandb.Image(val_inputs[-3:, ...], caption="UV input.")
+                        vis_log['Val-UV'] = wandb.Image(val_images[-3:, ...], caption="UV output.")
+                    if 'surf_normals' in self.data_fields:
+                        vis_log['Val-Normal-Input'] = wandb.Image(val_inputs[3:6, ...], caption="Normal input.")
+                        vis_log['Val-Normal'] = wandb.Image(val_images[3:6, ...], caption="Normal output.")
+                    if 'surf_mask' in self.data_fields:
+                        vis_log['Val-Mask-Input'] = wandb.Image(val_inputs[-1:, ...], caption="Mask input.")
+                        vis_log['Val-Mask'] = wandb.Image(val_images[-1:, ...], caption="Mask output.")
 
                     wandb.log(vis_log, step=self.iters)
+
+                    # Save validation images to disk
+                    vis_dir = os.path.join(self.log_dir, 'val_images')
+                    os.makedirs(vis_dir, exist_ok=True)
+                    save_image(val_inputs[:3, ...], os.path.join(vis_dir, f'input_e{self.epoch:04d}.png'))
+                    save_image(val_images[:3, ...], os.path.join(vis_dir, f'recon_e{self.epoch:04d}.png'))
+                    if 'surf_mask' in self.data_fields:
+                        save_image(val_inputs[-1:, ...], os.path.join(vis_dir, f'input_mask_e{self.epoch:04d}.png'))
+                        save_image(val_images[-1:, ...], os.path.join(vis_dir, f'recon_mask_e{self.epoch:04d}.png'))
+                    print(f'  Saved val images to {vis_dir}/ (epoch {self.epoch})')
 
         if self.vae_type == "kl":
             mse = total_loss / total_count
@@ -237,10 +287,10 @@ class VAETrainer():
             raise NotImplementedError
 
         self.val_dataset.update()
-        self.val_dataloader = torch.utils.data.DataLoader(self.val_dataset,
-                                             shuffle=False,
-                                             batch_size=self.batch_size,
-                                             num_workers=8)
+        self.val_dataloader = torch.utils.data.DataLoader(
+            self.val_dataset, shuffle=False, batch_size=self.batch_size,
+            num_workers=self.num_workers, pin_memory=True,
+            persistent_workers=True, prefetch_factor=2)
 
     def save_model(self):
         ckpt_log_dir = os.path.join(self.log_dir, 'ckpts')

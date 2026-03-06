@@ -92,6 +92,132 @@ class VaeData(torch.utils.data.Dataset):
         return torch.FloatTensor(self.cache[index%len(self.cache)])
 
 
+class LazyVaeData(torch.utils.data.Dataset):
+    """
+    Lazy-loading VAE Dataset with pre-extracted per-panel .npy files.
+
+    On first run, extracts needed fields from each garment pickle and saves
+    individual .npy files per panel (~1MB each vs 50MB pickle).
+    Subsequent runs load directly from .npy — 50x less I/O per item.
+    No in-process caching, so no RAM explosion with multi-worker DataLoader.
+
+    RAM usage: ~few MB (index only).
+    Return type matches VaeData exactly: torch.FloatTensor of shape (H, W, C).
+    """
+    def __init__(self,
+                 input_data,
+                 input_list,
+                 data_fields=['surf_ncs'],
+                 validate=False,
+                 aug=False,
+                 chunksize=-1,  # ignored, kept for arg compatibility
+                 args=None):
+        self.args = args
+        self.validate = validate
+        self.data_root = input_data
+        self.data_fields = data_fields
+
+        print('Loading %s data (lazy mode)...' % ('validation' if validate else 'training'))
+        with open(input_list, "rb") as tf:
+            file_list = pickle.load(tf)['val' if validate else 'train']
+            if args.use_data_root:
+                file_list = [
+                    os.path.join(self.data_root, os.path.basename(x)) for x in file_list
+                    if os.path.exists(os.path.join(self.data_root, os.path.basename(x)))
+                ]
+        print("Total garment files: ", len(file_list))
+
+        # Pre-extracted panel directory
+        fields_key = '_'.join(sorted(self.data_fields))
+        self.panel_dir = os.path.join(os.path.dirname(input_list), f'panels_{fields_key}')
+
+        # Build panel .npy files (one-time extraction) and get paths
+        self.panel_paths = self._build_panel_npy(file_list, input_list, validate)
+        print("Total panels (dataset length): ", len(self.panel_paths))
+
+        # Load one sample to determine shape metadata
+        sample = np.load(self.panel_paths[0])
+        self.num_channels = sample.shape[-1]
+        self.resolution = sample.shape[0]
+        print(f"Panel shape: ({self.resolution}, {self.resolution}, {self.num_channels})")
+
+    def _build_panel_npy(self, file_list, input_list, validate):
+        """
+        Extract per-panel .npy files from garment pickles (one-time).
+        Each .npy is ~1MB (256x256x4 float32) vs 50MB pickle.
+        Returns list of .npy file paths.
+        """
+        split_name = 'val' if validate else 'train'
+        index_cache_fp = os.path.join(self.panel_dir, f'index_{split_name}.pkl')
+
+        # Check if already extracted
+        if os.path.exists(index_cache_fp):
+            with open(index_cache_fp, 'rb') as f:
+                panel_paths = pickle.load(f)
+            if len(panel_paths) > 0 and os.path.exists(panel_paths[0]):
+                print(f'Loaded {len(panel_paths)} pre-extracted panels from {self.panel_dir}')
+                return panel_paths
+            else:
+                print('Panel cache is stale, re-extracting...')
+
+        # Extract panels to individual .npy files
+        os.makedirs(self.panel_dir, exist_ok=True)
+        panel_paths = []
+        skipped = 0
+
+        for fp in tqdm(file_list, desc=f'Extracting panels to .npy ({split_name})'):
+            try:
+                with open(fp, 'rb') as f:
+                    data = pickle.load(f)
+
+                garment_id = os.path.splitext(os.path.basename(fp))[0]
+                n_panels = data['surf_ncs'].shape[0]
+
+                for i in range(n_panels):
+                    channels = []
+                    if 'surf_ncs' in self.data_fields:
+                        channels.append(data['surf_ncs'][i].astype(np.float32))
+                    if 'surf_wcs' in self.data_fields:
+                        channels.append(data['surf_wcs'][i].astype(np.float32))
+                    if 'surf_uv_ncs' in self.data_fields:
+                        channels.append(data['surf_uv_ncs'][i].astype(np.float32))
+                    if 'surf_normals' in self.data_fields:
+                        channels.append(data['surf_normals'][i].astype(np.float32))
+                    if 'surf_mask' in self.data_fields:
+                        channels.append(data['surf_mask'][i].astype(np.float32) * 2.0 - 1.0)
+
+                    panel = np.concatenate(channels, axis=-1)
+                    npy_path = os.path.join(self.panel_dir, f'{garment_id}_p{i:02d}.npy')
+                    np.save(npy_path, panel)
+                    panel_paths.append(npy_path)
+            except Exception as e:
+                print(f"Error extracting {fp}: {e}")
+                skipped += 1
+                continue
+
+        if skipped > 0:
+            print(f'Skipped {skipped} files during extraction.')
+
+        # Save index
+        with open(index_cache_fp, 'wb') as f:
+            pickle.dump(panel_paths, f)
+        print(f'Extracted {len(panel_paths)} panels to {self.panel_dir} '
+              f'(~{len(panel_paths) // 1024}GB)')
+
+        return panel_paths
+
+    def update(self):
+        """No-op for trainer compatibility."""
+        pass
+
+    def __len__(self):
+        return len(self.panel_paths)
+
+    def __getitem__(self, index):
+        panel = np.load(self.panel_paths[index])
+        return torch.FloatTensor(panel)
+
+
 class GarmageNetData(torch.utils.data.Dataset):
     """ Surface latent geometry Dataloader """
     def __init__(

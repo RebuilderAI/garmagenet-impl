@@ -2,7 +2,7 @@ import os
 import argparse
 
 from trainer import VAETrainer
-from datasets.garmage import VaeData
+from datasets.garmage import VaeData, LazyVaeData
 
 
 def get_args_vae():
@@ -28,6 +28,7 @@ def get_args_vae():
     parser.add_argument("--data_aug",  action='store_true', help='Use data augmentation')
     parser.add_argument('--data_fields', nargs='+', default=['surf_ncs', 'surf_mask'], help="Data fields to encode.")
     parser.add_argument('--chunksize', type=int, default=-1, help='Chunk size for data loading')
+    parser.add_argument('--lazy_loading', action='store_true', help='Use lazy disk-based loading instead of RAM caching')
 
     # Model parameters
     parser.add_argument("--vae_type", choices=["kl"], default="kl")
@@ -47,11 +48,12 @@ def run(args):
     print('Args:', args)
     
     # Initialize dataset loader and trainer
-    train_dataset = VaeData(
-        args.data, args.list, data_fields=args.data_fields, 
+    DatasetClass = LazyVaeData if args.lazy_loading else VaeData
+    train_dataset = DatasetClass(
+        args.data, args.list, data_fields=args.data_fields,
         validate=False, aug=args.data_aug, chunksize=args.chunksize, args=args)
-    val_dataset = VaeData(
-        args.data, args.list, data_fields=args.data_fields, 
+    val_dataset = DatasetClass(
+        args.data, args.list, data_fields=args.data_fields,
         validate=True, aug=False, chunksize=args.chunksize, args=args)
     vae = VAETrainer(args, train_dataset, val_dataset)
 
