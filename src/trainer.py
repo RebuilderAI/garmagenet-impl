@@ -420,14 +420,14 @@ class GarmageNetTrainer():
         self.optimizer = torch.optim.AdamW(
             self.network_params,
             lr=args.lr,
-            betas=(0.9, 0.999),  # More standard momentum
+            betas=(0.95, 0.999),
             weight_decay=1e-6,
-            eps=1e-6,            # Increased for AMP stability
+            eps=1e-08,
         )
         self.scaler = torch.cuda.amp.GradScaler(
             init_scale=2.0 ** 16,
             growth_factor=1.5,
-            growth_interval=2000  # Fixed interval (was 5000 * steps_per_epoch ≈ 55000, too large)
+            growth_interval=5000 * steps_per_epoch(len(self.train_dataset), args.batch_size)
         )
         if args.finetune:
             try:
@@ -438,13 +438,14 @@ class GarmageNetTrainer():
             except (ValueError, RuntimeError) as e:
                 print(f"[WARN] Skipping optimizer/scaler load (architecture changed): {e}")
 
-        # LR Scheduler: warmup (1000 epochs) + cosine decay
-        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-        warmup_epochs = 1000
-        warmup_scheduler = LinearLR(self.optimizer, start_factor=0.01, total_iters=warmup_epochs)
-        cosine_scheduler = CosineAnnealingLR(self.optimizer, T_max=max(args.train_nepoch - warmup_epochs, 1), eta_min=1e-6)
-        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
-        print(f"[LR Schedule] Warmup {warmup_epochs} epochs → Cosine decay to 1e-6 over {args.train_nepoch} epochs")
+        # [REVERTED] Removed LR Scheduler to match original fixed LR behavior
+        self.scheduler = None
+        # from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        # warmup_epochs = 1000
+        # warmup_scheduler = LinearLR(self.optimizer, start_factor=0.01, total_iters=warmup_epochs)
+        # cosine_scheduler = CosineAnnealingLR(self.optimizer, T_max=max(args.train_nepoch - warmup_epochs, 1), eta_min=1e-6)
+        # self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+        print(f"[LR Schedule] Using FIXED learning rate: {args.lr}")
 
         # Initialize wandb
         run_id, run_step = get_wandb_logging_meta(os.path.join(args.log_dir, 'wandb'))
@@ -552,7 +553,7 @@ class GarmageNetTrainer():
                     )
 
                     # Loss
-                    total_loss = loss_z_noise * 1.0 + loss_pos_noise * 1.0  # Reduced weight for stability (was 7.0)
+                    total_loss = loss_z_noise * 1.0 + loss_pos_noise * 7.0  # Restored to original magic number 7.0
                 
                 else:
                     raise NotImplementedError
@@ -572,13 +573,11 @@ class GarmageNetTrainer():
                     raise RuntimeError(f'NaN loss at epoch {self.epoch}')
 
                 # Update model ===
-                # NOTE: torch.autograd.set_detect_anomaly(True) is useful for debugging NaNs but 
-                # significantly slows down training (approx. 2-3x slower). Only enable when debugging.
+                # NOTE: Anomaly detection is disabled for performance.
                 # with torch.autograd.set_detect_anomaly(True):
-                #     self.scaler.scale(total_loss).backward()
                 self.scaler.scale(total_loss).backward()
 
-                nn.utils.clip_grad_norm_(self.network_params, max_norm=50.0)  # restore to 50.0 (was 1.0, too tight)
+                nn.utils.clip_grad_norm_(self.network_params, max_norm=50.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
