@@ -59,9 +59,9 @@ class VAETrainer():
 
         if args.finetune:
             state_dict = torch.load(args.weight)
-            if 'model_state_dict' in state_dict: model.load_state_dict(state_dict['model_state_dict'])
-            elif 'model' in state_dict: model.load_state_dict(state_dict['model'])
-            else: model.load_state_dict(state_dict)
+            if 'model_state_dict' in state_dict: model.load_state_dict(state_dict['model_state_dict'], strict=False)
+            elif 'model' in state_dict: model.load_state_dict(state_dict['model'], strict=False)
+            else: model.load_state_dict(state_dict, strict=False)
             print('Load SurfZNet checkpoint from %s.'%(args.weight))
 
         self.model = model.to(self.device).train()
@@ -388,9 +388,9 @@ class GarmageNetTrainer():
                 self.z_scaled = train_dataset.z_scaled = val_dataset.z_scaled = state_dict['z_scaled']
             if 'bbox_scaled' in state_dict:
                 self.bbox_scaled = train_dataset.bbox_scaled = val_dataset.bbox_scaled = state_dict['bbox_scaled']
-            if 'model_state_dict' in state_dict: model.load_state_dict(state_dict['model_state_dict'])
-            elif 'model' in state_dict: model.load_state_dict(state_dict['model'])
-            else: model.load_state_dict(state_dict)
+            if 'model_state_dict' in state_dict: model.load_state_dict(state_dict['model_state_dict'], strict=False)
+            elif 'model' in state_dict: model.load_state_dict(state_dict['model'], strict=False)
+            else: model.load_state_dict(state_dict, strict=False)
             print('Load checkpoint from %s.'%(args.weight))
 
         model = nn.DataParallel(model, device_ids=self.device_ids) # distributed training
@@ -427,13 +427,24 @@ class GarmageNetTrainer():
         self.scaler = torch.cuda.amp.GradScaler(
             init_scale=2.0 ** 16,
             growth_factor=1.5,
-            growth_interval=5000 * steps_per_epoch(len(self.train_dataset), args.batch_size)
+            growth_interval=2000  # Fixed interval (was 5000 * steps_per_epoch ≈ 55000, too large)
         )
         if args.finetune:
-            if "optimizer" in state_dict:
-                self.optimizer.load_state_dict(state_dict["optimizer"])
-            if "scaler" in state_dict:
-                self.scaler.load_state_dict(state_dict["scaler"])
+            try:
+                if "optimizer" in state_dict:
+                    self.optimizer.load_state_dict(state_dict["optimizer"])
+                if "scaler" in state_dict:
+                    self.scaler.load_state_dict(state_dict["scaler"])
+            except (ValueError, RuntimeError) as e:
+                print(f"[WARN] Skipping optimizer/scaler load (architecture changed): {e}")
+
+        # LR Scheduler: warmup (1000 epochs) + cosine decay
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        warmup_epochs = 1000
+        warmup_scheduler = LinearLR(self.optimizer, start_factor=0.01, total_iters=warmup_epochs)
+        cosine_scheduler = CosineAnnealingLR(self.optimizer, T_max=max(args.train_nepoch - warmup_epochs, 1), eta_min=1e-6)
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+        print(f"[LR Schedule] Warmup {warmup_epochs} epochs → Cosine decay to 1e-6 over {args.train_nepoch} epochs")
 
         # Initialize wandb
         run_id, run_step = get_wandb_logging_meta(os.path.join(args.log_dir, 'wandb'))
@@ -546,21 +557,38 @@ class GarmageNetTrainer():
                 else:
                     raise NotImplementedError
 
+
+                # === NaN detection (non-intrusive safety check) ===
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f'\n[FATAL] NaN/Inf at epoch {self.epoch}, iter {self.iters}')
+                    ckpt_path = os.path.join(self.log_dir, 'ckpts', 'emergency_pre_nan.pt')
+                    torch.save({
+                        'model_state_dict': self.model.module.state_dict() if hasattr(self.model, 'module') else self.model.state_dict(),
+                        'z_scaled': self.z_scaled, 'bbox_scaled': self.bbox_scaled,
+                        'optimizer': self.optimizer.state_dict(),
+                        'scaler': self.scaler.state_dict(),
+                        'epoch': self.epoch, 'iters': self.iters,
+                    }, ckpt_path)
+                    raise RuntimeError(f'NaN loss at epoch {self.epoch}')
+
                 # Update model ===
                 self.scaler.scale(total_loss).backward()
 
-                nn.utils.clip_grad_norm_(self.network_params, max_norm=50.0)  # clip gradient
+                nn.utils.clip_grad_norm_(self.network_params, max_norm=1.0)  # clip gradient (was 50.0, too loose)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
                 # logging
                 if self.iters % 10 == 0:
-                    wandb.log({
+                    log_dict = {
                         "epoch": self.epoch,
                         "total_loss": total_loss,
                         'loss_latent': loss_z_noise.item(),
                         'loss_bbox': loss_pos_noise.item(),
-                    }, step=self.iters)
+                    }
+                    if hasattr(self, 'scheduler'):
+                        log_dict['lr'] = self.scheduler.get_last_lr()[0]
+                    wandb.log(log_dict, step=self.iters)
 
                 self.iters += 1
                 progress_bar.update(1)
@@ -575,6 +603,11 @@ class GarmageNetTrainer():
                 batch_size=self.batch_size, num_workers=16)
 
         self.epoch += 1
+
+        # Step LR scheduler (per epoch)
+        if hasattr(self, 'scheduler'):
+            self.scheduler.step()
+
         if self.epoch % 1000 == 0:
             torch.cuda.empty_cache()
         return

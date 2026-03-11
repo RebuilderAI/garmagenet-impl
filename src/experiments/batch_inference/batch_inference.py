@@ -22,7 +22,10 @@ from src.pc_utils import normalize_pointcloud
 
 
 # Visualize pointcloud condition
-def pointcloud_condition_visualize(vertices: np.ndarray, output_fp=None):
+def pointcloud_condition_visualize(vertices, output_fp=None):
+    if hasattr(vertices, 'numpy'):
+        vertices = vertices.numpy()
+    vertices = np.asarray(vertices)
     assert vertices.ndim == 2 and vertices.shape[1] == 3, "vertices should be ndarray in (Nx3)"
 
     x, y, z = vertices[:, 0], vertices[:, 1], vertices[:, 2]
@@ -388,7 +391,10 @@ def run_cache(args):
 
     with open(args.cache, 'rb') as f: data_cache = pickle.load(f)
 
-    for sample_data_idx in tqdm(range(len(data_cache['item_idx']))):
+    n_samples = len(data_cache['item_idx'])
+    if args.max_samples is not None:
+        n_samples = min(n_samples, args.max_samples)
+    for sample_data_idx in tqdm(range(n_samples)):
         if "caption" in data_cache:
             caption = data_cache['caption'][sample_data_idx]
         else:
@@ -519,6 +525,7 @@ if __name__ == "__main__":
                         help="Text encoder type when applying text as generation condition.")
 
     parser.add_argument('--device', type=str, default="cuda", help='')
+    parser.add_argument('--max_samples', type=int, default=None, help='Max number of samples to run inference on (default: all)')
 
     args = parser.parse_args()
 

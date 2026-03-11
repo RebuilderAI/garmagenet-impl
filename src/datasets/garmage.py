@@ -269,14 +269,61 @@ class GarmageNetData(torch.utils.data.Dataset):
 
         print('Loading %s data...'%('validation' if validate else 'training'))
         with open(input_list, 'rb') as f: self.data_list = pickle.load(f)['val' if self.validate else 'train']
+        self._cache_only = False
         if args.use_data_root:
-            self.data_list = [os.path.join(self.data_root, os.path.basename(x)) for x in self.data_list
-                              if os.path.exists(os.path.join(self.data_root, os.path.basename(x)))]
+            filtered = [os.path.join(self.data_root, os.path.basename(x)) for x in self.data_list
+                        if os.path.exists(os.path.join(self.data_root, os.path.basename(x)))]
+            if len(filtered) > 0:
+                self.data_list = filtered
+            elif os.path.exists(self.cache_fp):
+                # Cache-only mode: raw garmage pkl files not available, use pre-built latent cache.
+                # This allows LDM training without the full ~638GB garmages/ directory.
+                print(f'[Cache-only mode] Raw data not found in {self.data_root}. '
+                      f'Will use pre-built cache at {self.cache_fp}')
+                self._cache_only = True
+            else:
+                raise FileNotFoundError(
+                    f"No raw data in {self.data_root} and no cache at {self.cache_fp}. "
+                    f"Provide either raw garmage data or pre-built latent cache files.")
 
+        if self._cache_only:
+            self._init_from_cache()
+        else:
+            random.shuffle(self.data_list)
+            print('Total items: ', len(self.data_list), self.data_list[0])
+            self.load_one_to_init()
+
+    def _init_from_cache(self):
+        """Initialize metadata from pre-built cache when raw garmage files are unavailable.
+        This enables LDM training without the ~638GB garmages/ directory — only the
+        pre-encoded latent cache files (~425MB) are needed."""
+        import math
+        print(f'[Cache-only] Loading metadata from {self.cache_fp}')
+        with open(self.cache_fp, 'rb') as f:
+            cache = pickle.load(f)
+
+        # pos_dim: surf_pos stores (bbox_min, bbox_max) pairs → half is the actual dimension
+        self.pos_dim = cache['surf_pos'].shape[-1] // 2
+        self.num_classes = _PANEL_CLS_NUM if 'surf_cls' in self.data_fields else 0
+
+        # num_channels: count surface data channels from data_fields
+        _ch_map = {'surf_ncs': 3, 'surf_wcs': 3, 'surf_uv_ncs': 2, 'surf_normals': 3, 'surf_mask': 1}
+        self.num_channels = sum(_ch_map.get(f, 0) for f in self.data_fields)
+
+        # resolution: reverse-engineer from latent dimension + VAE block structure
+        # latent_dim = (resolution / 2^(n_blocks-1))^2 * latent_channels
+        latent_dim = cache['latent'].shape[-1]
+        bottleneck = int(math.sqrt(latent_dim / self.args.latent_channels))
+        self.resolution = bottleneck * (2 ** (len(self.args.block_dims) - 1))
+
+        # Replace data_list with index range matching cache item count
+        num_items = len(cache['item_idx'])
+        self.data_list = list(range(num_items))
         random.shuffle(self.data_list)
-        print('Total items: ', len(self.data_list), self.data_list[0])
 
-        self.load_one_to_init()
+        print(f'[Cache-only] channels={self.num_channels}, resolution={self.resolution}, '
+              f'pos_dim={self.pos_dim}, num_classes={self.num_classes}, items={num_items}')
+        del cache
 
     def load_one_to_init(self):
         """

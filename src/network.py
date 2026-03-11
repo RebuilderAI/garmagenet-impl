@@ -300,7 +300,13 @@ class PointcloudEncoder:
         if encoder == 'POINT_E':
             from src.models.pc_backbone.point_e.evals.feature_extractor import PointNetClassifier
             self.pointcloud_emb_dim = 512
-            self.pointcloud_encoder = PointNetClassifier(devices=[self.device], cache_dir='/data/lsr/models/PFID_evaluator', device_batch_size=1)
+            # Use home-dir cache if the original path doesn't exist
+            import os
+            cache_dir = '/data/lsr/models/PFID_evaluator'
+            if not os.path.exists(cache_dir):
+                cache_dir = os.path.expanduser('~/point_e_model_cache')
+                os.makedirs(cache_dir, exist_ok=True)
+            self.pointcloud_encoder = PointNetClassifier(devices=[self.device], cache_dir=cache_dir, device_batch_size=1)
             self.pointcloud_embedder_fn = self._get_pointe_pointcloud_embeds
         else:
             raise NotImplementedError
@@ -431,8 +437,8 @@ class SpatialDiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
         
-        # Cross-Attention Layer
-        self.norm_cross = nn.LayerNorm(hidden_size)
+        # Cross-Attention Layer (norm uses elementwise_affine=False for AdaLN modulation)
+        self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -443,14 +449,14 @@ class SpatialDiTBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size),
         )
 
-        # AdaLN Modulation: 
-        # Regresses 6 parameters: 
-        # (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
-        # We generally treat Cross-Attn as "always on", or add gating for it too.
-        # Here we stick to standard DiT-AdaLNZero for the self-attn/mlp parts.
+        # AdaLN Modulation:
+        # Regresses 8 parameters:
+        # (shift_msa, scale_msa, gate_msa, shift_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp)
+        # Cross-Attn now also has gating (gate_cross) for training stability.
+        # Zero-init ensures gate_cross starts at 0, gradually opening during training.
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 8 * hidden_size, bias=True)
         )
         
     def modulate(self, x, shift, scale):
@@ -467,29 +473,25 @@ class SpatialDiTBlock(nn.Module):
         # print('SpatialDiTBlock input:', x.shape, t.shape, context.shape, mask.shape if mask is not None else None)
 
         # 1. Regress Modulation Parameters from Timestep
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(t)[:, None].chunk(6, dim=-1)
+        shift_msa, scale_msa, gate_msa, shift_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(t)[:, None].chunk(8, dim=-1)
         )
-
-        # print('*** adaLN output: ', shift_msa.shape, scale_msa.shape, gate_msa.shape, shift_mlp.shape, scale_mlp.shape, gate_mlp.shape)
 
         # 2. Self-Attention Block (Time-Modulated)
         x_norm = self.modulate(self.norm1(x), shift_msa, scale_msa)
-        # print('*** x_norm: ', x_norm.shape, x_norm.min(), x_norm.max())
-        
+
         # Handle mask for Self-Attention if needed (tgt_key_padding_mask)
         # Note: nn.MultiheadAttention expects key_padding_mask
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)
         x = x + gate_msa * attn_out
 
-        # 3. Cross-Attention Block (Spatially Aware)
-        # We usually apply standard Norm before Cross-Attn
+        # 3. Cross-Attention Block (Gated, Spatially Aware)
         if context is not None:
-            x_norm_cross = self.norm_cross(x)
+            x_norm_cross = self.modulate(self.norm_cross(x), shift_cross, torch.zeros_like(shift_cross))
             if context.ndim == 2:
                 context=context.unsqueeze(1)
             cross_out, _ = self.cross_attn(query=x_norm_cross, key=context, value=context)
-            x = x + cross_out 
+            x = x + gate_cross * cross_out
 
         # 4. MLP Block (Time-Modulated)
         x_norm = self.modulate(self.norm2(x), shift_mlp, scale_mlp)
