@@ -420,9 +420,9 @@ class GarmageNetTrainer():
         self.optimizer = torch.optim.AdamW(
             self.network_params,
             lr=args.lr,
-            betas=(0.95, 0.999),
+            betas=(0.9, 0.999),  # More standard momentum
             weight_decay=1e-6,
-            eps=1e-08,
+            eps=1e-6,            # Increased for AMP stability
         )
         self.scaler = torch.cuda.amp.GradScaler(
             init_scale=2.0 ** 16,
@@ -551,8 +551,8 @@ class GarmageNetTrainer():
                         pos_noise[~mask][:,]
                     )
 
-                    # Increase pos loss weight with magic number 7.0
-                    total_loss = loss_z_noise * 1.0 + loss_pos_noise * 7.0
+                    # Loss
+                    total_loss = loss_z_noise * 1.0 + loss_pos_noise * 1.0  # Reduced weight for stability (was 7.0)
                 
                 else:
                     raise NotImplementedError
@@ -572,9 +572,13 @@ class GarmageNetTrainer():
                     raise RuntimeError(f'NaN loss at epoch {self.epoch}')
 
                 # Update model ===
+                # NOTE: torch.autograd.set_detect_anomaly(True) is useful for debugging NaNs but 
+                # significantly slows down training (approx. 2-3x slower). Only enable when debugging.
+                # with torch.autograd.set_detect_anomaly(True):
+                #     self.scaler.scale(total_loss).backward()
                 self.scaler.scale(total_loss).backward()
 
-                nn.utils.clip_grad_norm_(self.network_params, max_norm=1.0)  # clip gradient (was 50.0, too loose)
+                nn.utils.clip_grad_norm_(self.network_params, max_norm=50.0)  # restore to 50.0 (was 1.0, too tight)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 

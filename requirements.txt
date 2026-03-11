@@ -1,9 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cu118
-torch~=2.6.0+cu118
-torchvision~=0.21.0+cu118
-diffusers[torch]==0.27
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+diffusers[torch]~=0.30.3
 transformers~=4.50.3
-wandb~=0.19.9
+wandb~=0.25.1
 matplotlib~=3.9.4
 scipy~=1.13.1
 trimesh~=4.6.6
@@ -15,11 +15,11 @@ easydict~=1.13
 numpy~=2.0.2
 plotly~=6.0.1
 tqdm~=4.67.1
-chamferdist~=1.0.3
+# chamferdist~=1.0.3
 requests~=2.32.3
 pillow~=11.1.0
 pyyaml~=6.0.2
-nvdiffrast~=0.3.3
+# nvdiffrast~=0.3.3  # install separately from GitHub
 einops~=0.8.1
 opencv-python~=4.11.0.86
 geomdl~=5.3.1
